@@ -22,10 +22,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
 import random
-import math
 import re
 import queue
-from collections import defaultdict, deque
+from collections import deque
+from shuffle_core import CustomShuffleAlgorithm
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
@@ -464,298 +464,6 @@ class MusicTrack:
         return f"<Track: {self.artist} - {self.title}>"
 
 
-class CustomShuffleAlgorithm:
-    """Custom shuffle algorithms for music playback"""
-    
-    @staticmethod
-    def smart_shuffle(tracks, config=None):
-        """
-        Smart Shuffle v2 - Optimized for large libraries (15K+ tracks)
-        
-        Uses Draft + Repair algorithm:
-          Phase 1: Weighted sort (O(n log n))
-          Phase 2: Fix clumping (O(n))
-        
-        For 15,000 tracks: ~50-100ms vs ~2-3 seconds
-        """
-        if not tracks:
-            return []
-
-        # Default config
-        if config is None:
-            config = {}
-        
-        # Tunables (with defaults if not in config)
-        RECENT_ARTISTS = config.get('recent_artists', 3)
-        RECENT_ALBUMS = config.get('recent_albums', 2)
-        RECENT_GENRES = config.get('recent_genres', 2)
-        LOOKAHEAD = config.get('lookahead', 400)  # bounds worst-case swap scanning
-        
-        # Unknown value detection
-        UNKNOWN_ARTIST = {"", "unknown artist"}
-        UNKNOWN_ALBUM = {"", "unknown album"}
-        UNKNOWN_GENRE = {"", "unknown"}
-        
-        now = time.time()
-        
-        # ---- Helper functions (priors for unknown values) ----
-        def _norm_rating(r):
-            if r is None:
-                return 0.50
-            try:
-                r = int(r or 0)
-            except:
-                return 0.50
-            if r == 0:
-                return 0.50
-            if r <= 5:
-                return max(0.0, min(1.0, r / 5.0))
-            if r <= 100:
-                return max(0.0, min(1.0, r / 100.0))
-            return max(0.0, min(1.0, r / 255.0))
-
-        def _novelty_score(play_count):
-            if play_count is None:
-                return 0.60
-            try:
-                pc = int(play_count or 0)
-            except:
-                return 0.60
-            
-            # Key fix: pc_eff = pc + 1 ensures pc=0 -> 1/(1+1)=0.5 (not 1.0)
-            # This prevents unplayed tracks from dominating the shuffle.
-            # pc=0 -> pc_eff=1 -> 1/(1+1)=0.5
-            # pc=1 -> pc_eff=2 -> 1/(1+2)=0.333...
-            pc_eff = max(pc, 0) + 1
-            return 1.0 / (1.0 + pc_eff)
-
-        def _recency_boost(last_played):
-            if last_played is None:
-                return 1.0
-            try:
-                lp = float(last_played)
-            except:
-                return 1.0
-            if lp <= 0:
-                return 1.0
-            age_days = max(0.0, (now - lp) / 86400.0)
-            half_life = 14.0
-            return 1.0 - math.exp(-age_days / half_life)
-
-        def _newness_boost(date_added):
-            if date_added is None:
-                return 0.20
-            try:
-                da = float(date_added)
-            except:
-                return 0.20
-            if da <= 0:
-                return 0.20
-            age_days = (now - da) / 86400.0
-            if age_days < 0:
-                age_days = 0.0
-            return 1.0 / (1.0 + (age_days / 30.0))
-
-        def _skip_penalty(t):
-            """Penalize tracks based on skip rate (skips per play)"""
-            pc = getattr(t, "play_count", 0) or 0
-            sk = getattr(t, "skips", 0) or 0
-            
-            if sk == 0:
-                return 0.0
-            
-            # Skip rate: what fraction of plays ended in skips?
-            skip_rate = sk / (pc + 1.0)
-            
-            # Use tanh for smooth saturation (handles skip_rate > 1.0)
-            # Range: 0.0 (never skipped) to ~0.4 (always skipped)
-            return 0.4 * math.tanh(skip_rate)
-
-        def _love_score(loved):
-            if loved is None:
-                return 0.25
-            return 1.0 if loved else 0.0
-
-        # Key functions - return None for unknown values (don't constrain missing tags)
-        def artist_key(t):
-            a = (t.artist or "").strip()
-            if not a or a.lower() in UNKNOWN_ARTIST:
-                return None
-            return a.lower()  # ✅ Normalized
-
-        def album_key(t):
-            a = (t.artist or "").strip()
-            alb = (t.album or "").strip()
-            if not alb or alb.lower() in UNKNOWN_ALBUM:
-                return None
-            # Normalize both parts (artist can be unknown; album still helps reduce clumping)
-            return f"{a.lower()}||{alb.lower()}"  # ✅ Both normalized
-
-        def genre_key(t):
-            g = (getattr(t, "genre", "") or "").strip()
-            if not g or g.lower() in UNKNOWN_GENRE:
-                return None
-            return g.lower()  # ✅ Normalized
-        
-        # ==== Artist Skip Rate Aggregation ====
-        # Compute skip rate per artist to catch patterns like
-        # "I've only heard 5 tracks from this artist and skipped all 5"
-        artist_plays = defaultdict(int)
-        artist_skips = defaultdict(int)
-        
-        for t in tracks:
-            ak = artist_key(t)
-            if ak is None:
-                continue
-            
-            pc = getattr(t, "play_count", 0) or 0
-            sk = getattr(t, "skips", 0) or 0
-            
-            artist_plays[ak] += pc
-            artist_skips[ak] += sk
-        
-        # Compute skip rate per artist
-        artist_skip_rate = {}
-        for ak, plays in artist_plays.items():
-            skips = artist_skips.get(ak, 0)
-            if plays == 0 and skips == 0:
-                artist_skip_rate[ak] = 0.0
-            else:
-                sr = skips / (plays + 1.0)
-                artist_skip_rate[ak] = math.tanh(sr)  # Smooth 0..1
-        
-        # ---- PHASE 1: DRAFT (compute weight once per track, then sort) ----
-        def _compute_weight(t):
-            """Compute weight ONCE per track (not in a loop)"""
-            # Random component (configurable)
-            random_min = config.get('random_min', 0.20)
-            random_range = config.get('random_range', 0.50)
-            w = random_min + random.random() * random_range
-            
-            rating = _norm_rating(getattr(t, "rating", None))
-            novelty = _novelty_score(getattr(t, "play_count", None))
-            rec = _recency_boost(getattr(t, "last_played", None))
-            newness = _newness_boost(getattr(t, "date_added", None))
-            loved = _love_score(getattr(t, "loved", None))
-            skip_pen = _skip_penalty(t)  # Pass track object, not just skips
-            
-            # Apply weights from config
-            w += config.get('rating_weight', 0.55) * rating
-            w += config.get('novelty_weight', 0.55) * novelty
-            w += config.get('recency_weight', 0.45) * rec
-            w += config.get('newness_weight', 0.20) * newness
-            w += config.get('loved_weight', 0.30) * loved
-            w -= config.get('skip_penalty_weight', 0.40) * skip_pen
-            
-            # Artist-level skip rate penalty (lighter than track-level)
-            ak = artist_key(t)
-            if ak is not None:
-                w -= config.get('artist_skip_weight', 0.10) * artist_skip_rate.get(ak, 0.0)
-            
-            if getattr(t, "bpm", 0) > 0:
-                w += config.get('bpm_bonus', 0.05)
-            
-            return max(w, 0.001)
-        
-        # Compute all weights and sort (O(n log n) - very fast)
-        weighted_tracks = [(-_compute_weight(t), t) for t in tracks]
-        weighted_tracks.sort(key=lambda x: x[0])  # key prevents comparing MusicTrack on ties
-        
-        # Extract sorted track list
-        draft = [t for _, t in weighted_tracks]
-        
-        # ---- PHASE 2: REPAIR (fix clumping by swapping) ----
-        result = []
-        recent_artists = deque(maxlen=RECENT_ARTISTS)
-        recent_albums = deque(maxlen=RECENT_ALBUMS)
-        recent_genres = deque(maxlen=RECENT_GENRES)
-        
-        i = 0
-        while i < len(draft):
-            track = draft[i]
-            
-            def passes_constraints(t, relax_level):
-                """
-                relax_level 0: all constraints
-                relax_level 1: relax genre
-                relax_level 2: relax album
-                relax_level 3: accept anything
-                """
-                if relax_level >= 3:
-                    return True
-
-                ak = artist_key(t)
-                al = album_key(t)
-                gk = genre_key(t)
-
-                if ak is not None and ak in recent_artists:
-                    return False
-                if relax_level < 2:
-                    if al is not None and al in recent_albums:
-                        return False
-                if relax_level < 1:
-                    if gk is not None and gk in recent_genres:
-                        return False
-                return True
-            
-            placed = False
-            
-            for relax_level in range(4):
-                # If current track is acceptable at this relaxation level, place it.
-                if passes_constraints(track, relax_level):
-                    result.append(track)
-                    # Only append non-None keys to recent lists
-                    ak = artist_key(track)
-                    al = album_key(track)
-                    gk = genre_key(track)
-                    if ak is not None:
-                        recent_artists.append(ak)
-                    if al is not None:
-                        recent_albums.append(al)
-                    if gk is not None:
-                        recent_genres.append(gk)
-                    i += 1
-                    placed = True
-                    break
-                
-                # Otherwise try to find a swap candidate that passes at this same relax level.
-                swap_found = False
-                for j in range(i + 1, min(len(draft), i + 1 + LOOKAHEAD)):
-                    if passes_constraints(draft[j], relax_level):
-                        draft[i], draft[j] = draft[j], draft[i]
-                        track = draft[i]  # refresh after swap
-                        swap_found = True
-                        break
-                
-                # If we swapped, retry placement at the same i (continue relax loop).
-                if swap_found:
-                    continue
-            
-            # Absolute fallback: never stall or drop a track.
-            if not placed:
-                result.append(track)
-                # Only append non-None keys to recent lists
-                ak = artist_key(track)
-                al = album_key(track)
-                gk = genre_key(track)
-                if ak is not None:
-                    recent_artists.append(ak)
-                if al is not None:
-                    recent_albums.append(al)
-                if gk is not None:
-                    recent_genres.append(gk)
-                i += 1
-        
-        return result
-    
-    @staticmethod
-    def truly_random(tracks):
-        """Standard random shuffle"""
-        shuffled = list(tracks)
-        random.shuffle(shuffled)
-        return shuffled
-
-
 class MusicPlayerGUI:
     def __init__(self, root):
         self.root = root
@@ -766,11 +474,19 @@ class MusicPlayerGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         
         # Music library
-        self.all_tracks = []
+        self.library_tracks = []       # Full scanned library (source of truth)
+        self.all_tracks = []           # Active working subset (filtered view)
         self.current_playlist = []
-        self.filtered_playlist = []  # For search filtering
-        self._search_job = None  # For search debouncing
+        self.filtered_playlist = []    # For search filtering
+        self._search_job = None        # For search debouncing
         self.current_index = 0
+
+        # Recent play history for shuffle history guard (Task 5)
+        # Stores (normalized_filepath, artist_key_or_None) tuples
+        self._recent_play_history = deque(maxlen=200)
+
+        # Debug flag: set MUSIC_SHUFFLER_DEBUG_SCAN=1 to enable scan spam (Task 8)
+        self.debug_scan_logging = os.getenv('MUSIC_SHUFFLER_DEBUG_SCAN', '0') == '1'
 
         # Thread locks for shared mutable state
         self._metadata_lock = threading.Lock()  # Protects self.player_metadata
@@ -1269,12 +985,20 @@ class MusicPlayerGUI:
             'skip_penalty_weight': 0.40,
             'artist_skip_weight': 0.10,
             'bpm_bonus': 0.05,
-            
+
             # Constraint parameters
             'recent_artists': 3,
             'recent_albums': 2,
             'recent_genres': 2,
             'lookahead': 400,
+
+            # Adaptive spacing (Task 4)
+            'adaptive_constraints': True,
+
+            # History guard (Task 5)
+            'history_guard_size': 30,
+            'history_track_penalty': 0.35,
+            'history_artist_penalty': 0.15,
         }
         
         # Load saved configuration if it exists
@@ -1379,20 +1103,52 @@ class MusicPlayerGUI:
             ('recent_genres', 'Recent Genres', 1, 10, 1, 'Avoid repeating genres'),
             ('lookahead', 'Lookahead', 50, 1000, 50, 'How far ahead to search for swaps'),
         ]
-        
+
         for param, label, min_val, max_val, increment, tooltip in constraint_params:
             ttk.Label(scrollable_frame, text=f"{label}:").grid(row=row, column=0, sticky=tk.W, padx=(10, 5), pady=3)
-            
+
             var = tk.IntVar(value=self.shuffle_config.get(param, 0))
             vars_dict[param] = var
-            
-            spinbox = ttk.Spinbox(scrollable_frame, from_=min_val, to=max_val, 
-                                increment=increment, textvariable=var, width=8)
+
+            spinbox = ttk.Spinbox(scrollable_frame, from_=min_val, to=max_val,
+                                  increment=increment, textvariable=var, width=8)
             spinbox.grid(row=row, column=1, sticky=tk.W, padx=5, pady=3)
-            
-            ttk.Label(scrollable_frame, text=f"({tooltip})", 
-                    font=('Arial', 8), foreground='gray').grid(row=row, column=2, sticky=tk.W, padx=5, pady=3)
-            
+
+            ttk.Label(scrollable_frame, text=f"({tooltip})",
+                      font=('Arial', 8), foreground='gray').grid(row=row, column=2, sticky=tk.W, padx=5, pady=3)
+            row += 1
+
+        # Adaptive & History parameters (Tasks 4, 5, 6)
+        ttk.Label(scrollable_frame, text="Adaptive & History Parameters",
+                  font=('Arial', 11, 'bold')).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(15, 10))
+        row += 1
+
+        # adaptive_constraints checkbox
+        adapt_var = tk.BooleanVar(value=bool(self.shuffle_config.get('adaptive_constraints', True)))
+        vars_dict['adaptive_constraints'] = adapt_var
+        ttk.Checkbutton(scrollable_frame, text="Adaptive Constraints",
+                        variable=adapt_var).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=(10, 5), pady=3)
+        ttk.Label(scrollable_frame, text="(auto-scale spacing from library size)",
+                  font=('Arial', 8), foreground='gray').grid(row=row, column=2, sticky=tk.W, padx=5, pady=3)
+        row += 1
+
+        history_params = [
+            ('history_guard_size',    'History Guard Size',   5, 200, 5,    'Recent tracks checked for penalty'),
+            ('history_track_penalty', 'Track Penalty',        0.0, 1.0, 0.05, 'Weight penalty for recently played tracks'),
+            ('history_artist_penalty','Artist Penalty',       0.0, 1.0, 0.05, 'Weight penalty for recently played artists'),
+        ]
+        for param, label, min_val, max_val, increment, tooltip in history_params:
+            ttk.Label(scrollable_frame, text=f"{label}:").grid(row=row, column=0, sticky=tk.W, padx=(10, 5), pady=3)
+            if isinstance(self.shuffle_config.get(param, 0), int) or increment == 5:
+                var = tk.IntVar(value=int(self.shuffle_config.get(param, 0)))
+            else:
+                var = tk.DoubleVar(value=self.shuffle_config.get(param, 0.0))
+            vars_dict[param] = var
+            ttk.Spinbox(scrollable_frame, from_=min_val, to=max_val,
+                        increment=increment, textvariable=var, width=8).grid(
+                row=row, column=1, sticky=tk.W, padx=5, pady=3)
+            ttk.Label(scrollable_frame, text=f"({tooltip})",
+                      font=('Arial', 8), foreground='gray').grid(row=row, column=2, sticky=tk.W, padx=5, pady=3)
             row += 1
         
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1433,6 +1189,10 @@ class MusicPlayerGUI:
                     'recent_albums': 2,
                     'recent_genres': 2,
                     'lookahead': 400,
+                    'adaptive_constraints': True,
+                    'history_guard_size': 30,
+                    'history_track_penalty': 0.35,
+                    'history_artist_penalty': 0.15,
                 }
                 for param, var in vars_dict.items():
                     var.set(defaults.get(param, 0))
@@ -2042,7 +1802,7 @@ class MusicPlayerGUI:
                 self._metadata_save_queue.get(timeout=0.5)
                 
                 # Debounce: wait a bit in case more saves are coming
-                time.sleep(0.1)
+                time.sleep(METADATA_SAVE_DEBOUNCE_SEC)
                 
                 # Drain queue (multiple rapid saves = one actual save)
                 while not self._metadata_save_queue.empty():
@@ -2609,12 +2369,13 @@ class MusicPlayerGUI:
                 ext = os.path.splitext(filepath)[1].lower()
                 file_types[ext] = file_types.get(ext, 0) + 1
             
-            print("\n" + "="*60)
-            print("SCAN DEBUG - File types found:")
-            for ext, count in sorted(file_types.items(), key=lambda x: x[1], reverse=True):
-                print(f"  {ext}: {count} files")
-            print(f"Total files found: {len(current_files)}")
-            print("="*60 + "\n")
+            if self.debug_scan_logging:
+                print("\n" + "="*60)
+                print("SCAN DEBUG - File types found:")
+                for ext, count in sorted(file_types.items(), key=lambda x: x[1], reverse=True):
+                    print(f"  {ext}: {count} files")
+                print(f"Total files found: {len(current_files)}")
+                print("="*60 + "\n")
             
             files_to_scan = []
             
@@ -2622,8 +2383,9 @@ class MusicPlayerGUI:
                 cached_mtimes = cached_data.get('mtimes', {})
                 cached_tracks = cached_data.get('tracks', {})
                 
-                print(f"\n[CACHE] Found {len(cached_tracks)} tracks in cache")
-                
+                if self.debug_scan_logging:
+                    print(f"\n[CACHE] Found {len(cached_tracks)} tracks in cache")
+
                 cached_loaded = 0
                 cached_skipped = 0
                 for filepath, mtime in current_files.items():
@@ -2633,28 +2395,31 @@ class MusicPlayerGUI:
                     else:
                         if filepath in cached_tracks:
                             track = cached_tracks[filepath]
-                            
+
                             if not os.path.exists(track.filepath):
                                 files_to_scan.append(filepath)
-                                print(f"⚠ Cache broken for {os.path.basename(filepath)} - will re-process")
+                                if self.debug_scan_logging:
+                                    print(f"⚠ Cache broken for {os.path.basename(filepath)} - will re-process")
                             else:
                                 # V2: Apply unified player metadata
                                 norm_fp = self._norm_path(filepath)
                                 player_meta = self.player_metadata.get(norm_fp)
                                 if player_meta:
                                     track._apply_player_metadata(player_meta)
-                                
+
                                 temp_all_tracks.append(track)
                                 cached_loaded += 1
                         else:
                             files_to_scan.append(filepath)
                             cached_skipped += 1
-                
-                print(f"[CACHE] Loaded {cached_loaded} tracks from cache")
-                print(f"[CACHE] {cached_skipped} files in current_files not found in cache")
-                print(f"[CACHE] {len(files_to_scan)} files need scanning (new/modified/broken)")
+
+                if self.debug_scan_logging:
+                    print(f"[CACHE] Loaded {cached_loaded} tracks from cache")
+                    print(f"[CACHE] {cached_skipped} files in current_files not found in cache")
+                    print(f"[CACHE] {len(files_to_scan)} files need scanning (new/modified/broken)")
             else:
-                print("[CACHE] No cache found - will scan all files")
+                if self.debug_scan_logging:
+                    print("[CACHE] No cache found - will scan all files")
                 files_to_scan = list(current_files.keys())
             
             if files_to_scan:
@@ -2686,40 +2451,33 @@ class MusicPlayerGUI:
                 final_status = f"✓ Loaded {len(temp_all_tracks)} tracks from cache"
                 self.root.after(0, lambda: self.status_label.config(text=final_status))
             
-            print("\n" + "="*60)
-            print("SCAN COMPLETE - Final track counts:")
-            final_types = {}
-            for track in temp_all_tracks:
-                ext = os.path.splitext(track.original_filepath if hasattr(track, 'original_filepath') else track.filepath)[1].lower()
-                final_types[ext] = final_types.get(ext, 0) + 1
-            
-            for ext, count in sorted(final_types.items(), key=lambda x: x[1], reverse=True):
-                print(f"  {ext}: {count} tracks")
-            print(f"\nTotal tracks in library: {len(temp_all_tracks)}")
-            print(f"Total files found on disk: {self._last_scan_total_files}")
-            print(f"Difference: {self._last_scan_total_files - len(temp_all_tracks)} files NOT loaded")
-            
-            try:
-                with_loved = sum(1 for t in temp_all_tracks if getattr(t, 'loved', None) is not None)
-                with_last_played = sum(1 for t in temp_all_tracks if getattr(t, 'last_played', None) is not None)
-                with_skips = sum(1 for t in temp_all_tracks if getattr(t, 'skips', None) is not None)
-                with_date_added = sum(1 for t in temp_all_tracks if getattr(t, 'date_added', None) is not None)
-                
-                if any([with_loved, with_last_played, with_skips, with_date_added]):
-                    print("\nPlayer metadata found:")
-                    if with_loved > 0:
-                        print(f"  Loved: {with_loved} tracks")
-                    if with_last_played > 0:
-                        print(f"  Last Played: {with_last_played} tracks")
-                    if with_skips > 0:
-                        print(f"  Skips: {with_skips} tracks")
-                    if with_date_added > 0:
-                        print(f"  Date Added: {with_date_added} tracks")
-            except:
-                pass
-            
-            print("="*60 + "\n")
-            
+            if self.debug_scan_logging:
+                print("\n" + "="*60)
+                print("SCAN COMPLETE - Final track counts:")
+                final_types = {}
+                for track in temp_all_tracks:
+                    ext = os.path.splitext(track.original_filepath if hasattr(track, 'original_filepath') else track.filepath)[1].lower()
+                    final_types[ext] = final_types.get(ext, 0) + 1
+                for ext, count in sorted(final_types.items(), key=lambda x: x[1], reverse=True):
+                    print(f"  {ext}: {count} tracks")
+                print(f"\nTotal tracks in library: {len(temp_all_tracks)}")
+                print(f"Total files found on disk: {self._last_scan_total_files}")
+                print(f"Difference: {self._last_scan_total_files - len(temp_all_tracks)} files NOT loaded")
+                try:
+                    with_loved      = sum(1 for t in temp_all_tracks if getattr(t, 'loved', None) is not None)
+                    with_last_played = sum(1 for t in temp_all_tracks if getattr(t, 'last_played', None) is not None)
+                    with_skips      = sum(1 for t in temp_all_tracks if getattr(t, 'skips', None) is not None)
+                    with_date_added = sum(1 for t in temp_all_tracks if getattr(t, 'date_added', None) is not None)
+                    if any([with_loved, with_last_played, with_skips, with_date_added]):
+                        print("\nPlayer metadata found:")
+                        if with_loved       > 0: print(f"  Loved: {with_loved} tracks")
+                        if with_last_played > 0: print(f"  Last Played: {with_last_played} tracks")
+                        if with_skips       > 0: print(f"  Skips: {with_skips} tracks")
+                        if with_date_added  > 0: print(f"  Date Added: {with_date_added} tracks")
+                except Exception:
+                    pass
+                print("="*60 + "\n")
+
             # Log any files that were skipped during discovery
             if skipped_files:
                 print("⚠ Files skipped during scan:")
@@ -2756,8 +2514,9 @@ class MusicPlayerGUI:
             
             if duplicates > 0:
                 print(f"🗑 Removed {duplicates} duplicate entries")
-            
-            self.all_tracks = unique_tracks
+
+            self.library_tracks = unique_tracks          # Task 1: full source-of-truth
+            self.all_tracks = list(self.library_tracks)  # active working subset
             
             self.save_cache(current_files)
             
@@ -3453,25 +3212,21 @@ class MusicPlayerGUI:
         result_label.pack(pady=10)
         
         def apply_filter():
-            filtered = []
-            
             artist_filter = artist_var.get().lower()
-            album_filter = album_var.get().lower()
-            genre_filter = genre_var.get().lower()
-            min_rating = rating_var.get()
-            
-            for track in self.all_tracks:
-                if artist_filter and artist_filter not in track.artist.lower():
-                    continue
-                if album_filter and album_filter not in track.album.lower():
-                    continue
-                if genre_filter and genre_filter not in track.genre.lower():
-                    continue
-                if track.rating < min_rating:
-                    continue
-                
-                filtered.append(track)
-            
+            album_filter  = album_var.get().lower()
+            genre_filter  = genre_var.get().lower()
+            min_rating    = rating_var.get()
+
+            # Task 1: filter from full library_tracks (non-destructive)
+            source = self.library_tracks if self.library_tracks else self.all_tracks
+            filtered = [
+                t for t in source
+                if (not artist_filter or artist_filter in t.artist.lower())
+                and (not album_filter  or album_filter  in t.album.lower())
+                and (not genre_filter  or genre_filter  in t.genre.lower())
+                and t.rating >= min_rating
+            ]
+
             if filtered:
                 self.all_tracks = filtered
                 self.update_library_stats()
@@ -3480,10 +3235,17 @@ class MusicPlayerGUI:
                 messagebox.showinfo("Filter Applied", f"Filtered to {len(filtered)} tracks")
             else:
                 result_label.config(text="No tracks match these filters!")
-        
+
         def reset_filter():
-            self.scan_library()
-            dialog.destroy()
+            # Task 1: restore from library_tracks without triggering a full rescan
+            if self.library_tracks:
+                self.all_tracks = list(self.library_tracks)
+                self.update_library_stats()
+                self.apply_shuffle()
+                dialog.destroy()
+            else:
+                self.scan_library()
+                dialog.destroy()
         
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(pady=10)
@@ -3515,7 +3277,11 @@ class MusicPlayerGUI:
             
             def compute_shuffle():
                 try:
-                    result = CustomShuffleAlgorithm.smart_shuffle(tracks_snapshot, self.shuffle_config)
+                    history_snapshot = list(self._recent_play_history)
+                    result = CustomShuffleAlgorithm.smart_shuffle(
+                        tracks_snapshot, self.shuffle_config,
+                        recent_history=history_snapshot,
+                    )
                     
                     def apply_if_latest():
                         if getattr(self, "_shuffle_token", 0) != token:
@@ -3668,31 +3434,31 @@ class MusicPlayerGUI:
         self.filter_playlist()
     
     def filter_playlist(self):
-        """Filter playlist based on search query - searches entire library"""
+        """Filter playlist based on search query - searches active playlist/view"""
         query = self.search_var.get().lower().strip()
-        
+
         if not query:
-            # No search query - clear filter and show current playlist
             self.filtered_playlist = []
             self.display_playlist()
             if hasattr(self, 'status_label'):
                 self.status_label.config(text=f"{len(self.current_playlist)} tracks")
             return
-        
-        # Search entire library (all_tracks) by title, artist, album, or genre
+
+        # Task 2: search within the active playlist/view (not the full library)
         self.filtered_playlist = [
-            track for track in self.all_tracks
-            if query in track.title.lower()
-            or query in track.artist.lower()
-            or query in track.album.lower()
-            or query in track.genre.lower()
+            t for t in self.current_playlist
+            if query in t.title.lower()
+            or query in t.artist.lower()
+            or query in t.album.lower()
+            or query in t.genre.lower()
         ]
-        
+
         self.display_playlist()
-        
-        # Update status to show search results
+
         if hasattr(self, 'status_label'):
-            self.status_label.config(text=f"Showing {len(self.filtered_playlist)} of {len(self.all_tracks)} tracks")
+            self.status_label.config(
+                text=f"Showing {len(self.filtered_playlist)} of {len(self.current_playlist)} tracks"
+            )
     
     def clear_search(self):
         """Clear search box and show full playlist"""
@@ -3703,17 +3469,17 @@ class MusicPlayerGUI:
         """Play first search result when Enter is pressed"""
         if not self.filtered_playlist:
             return
-        
-        # Get first result
+
         first_track = self.filtered_playlist[0]
-        
-        # Try to find it in current playlist
+        target_fp = self._norm_path(first_track.filepath)
+
+        # Task 2: use _norm_path for reliable cross-case/separator comparison
         for i, track in enumerate(self.current_playlist):
-            if track.filepath == first_track.filepath:
+            if self._norm_path(getattr(track, 'filepath', '')) == target_fp:
                 self.play_track_at_index(i)
                 return
-        
-        # If not in current playlist, create temporary playlist with this track
+
+        # Fallback: track not found in current playlist (shouldn't happen post-Task 2)
         self.current_playlist = [first_track]
         self.current_index = 0
         self.play_track_at_index(0)
@@ -3770,28 +3536,30 @@ class MusicPlayerGUI:
         fp = getattr(track, 'filepath', None)
         if not fp:
             return
-        
+
+        # Task 2: normalise paths for reliable cross-case/separator comparison
+        norm_fp = self._norm_path(fp)
+
         # Don't queue currently playing track
         if 0 <= self.current_index < len(self.current_playlist):
             current_track = self.current_playlist[self.current_index]
-            if getattr(current_track, 'filepath', None) == fp:
+            if self._norm_path(getattr(current_track, 'filepath', '')) == norm_fp:
                 self.status_label.config(text="Cannot queue currently playing track")
                 return
-        
-        # Check if already queued
-        if fp in self.up_next_set:
+
+        # Check if already queued (deduplication via normalised path set)
+        if norm_fp in self.up_next_set:
             self.status_label.config(text="Already in Up Next")
             return
-        
-        # Add to queue
+
         if play_next:
             self.up_next.appendleft(track)
             self.status_label.config(text=f"▶ Will play next: {track.title}")
         else:
             self.up_next.append(track)
             self.status_label.config(text=f"Added to Up Next ({len(self.up_next)} queued)")
-        
-        self.up_next_set.add(fp)
+
+        self.up_next_set.add(norm_fp)
     
     def view_up_next(self):
         """Show Up Next queue in a dialog"""
@@ -3909,12 +3677,17 @@ class MusicPlayerGUI:
             # V2: Increment play count for ALL tracks (defensive programming)
             track.play_count = (track.play_count or 0) + 1
             track.last_played = int(time.time())
-            
+
             # Set date_added if not already set (None check preserves 0 and imported values)
             if track.date_added is None:
                 track.date_added = int(time.time())
-            
+
             self._update_track_metadata(track)
+
+            # Task 5: record in recent play history for shuffle history guard
+            norm_fp   = self._norm_path(track.filepath)
+            artist_k  = (track.artist or "").strip().lower() or None
+            self._recent_play_history.append((norm_fp, artist_k))
             print(f"▶ Playing: {track.title}{ext} (plays: {track.play_count})")
             
             self._seek_base_sec = 0.0
@@ -4049,8 +3822,9 @@ class MusicPlayerGUI:
         if self.up_next:
             next_track = self.up_next.popleft()
             fp = getattr(next_track, 'filepath', None)
-            if fp in self.up_next_set:
-                self.up_next_set.remove(fp)
+            if fp:
+                norm_fp = self._norm_path(fp)
+                self.up_next_set.discard(norm_fp)
             
             # Try to find track in current playlist
             idx = None
@@ -4102,14 +3876,17 @@ class MusicPlayerGUI:
                 pass  # Window destroyed or Tcl interpreter deleted
         
         def update_progress():
+            _tick = 0.1  # seconds per loop iteration
+            _volume_sync_ticks = round(VOLUME_SYNC_INTERVAL_SEC / _tick)
+
             last_pos = 0
             end_detected = False
             volume_sync_counter = 0
-            
+
             while True:
-                # Sync volume slider with system volume every 2 seconds
+                # Sync volume slider with system volume every VOLUME_SYNC_INTERVAL_SEC
                 volume_sync_counter += 1
-                if volume_sync_counter >= 20:  # 20 * 0.1s = 2 seconds
+                if volume_sync_counter >= _volume_sync_ticks:
                     volume_sync_counter = 0
                     safe_ui_call(self._sync_volume_slider)
                 
@@ -4174,7 +3951,7 @@ class MusicPlayerGUI:
                                 # Dynamic buffer: 10% of track or 2 seconds, whichever is less
                                 # This prevents short tracks (<2s) from never ending
                                 if track.duration > 0:
-                                    buffer = min(track.duration * 0.1, 2.0)
+                                    buffer = min(track.duration * 0.1, END_DETECTION_BUFFER_SEC)
                                     if pos >= (track.duration - buffer):
                                         end_detected = True
                                         last_pos = 0
@@ -4193,8 +3970,8 @@ class MusicPlayerGUI:
                         # Log unexpected errors but don't crash the thread
                         print(f"⚠ Progress update error: {e}")
                         time.sleep(1)  # Back off briefly before retrying
-                
-                time.sleep(0.1)
+
+                time.sleep(_tick)
         
         thread = threading.Thread(target=update_progress, daemon=True)
         thread.start()
