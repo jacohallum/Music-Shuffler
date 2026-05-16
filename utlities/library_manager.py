@@ -392,6 +392,11 @@ class iTunesCOMRefresher:
             except Exception:
                 continue
 
+    def disconnect(self) -> None:
+        """Release the COM reference so iTunes can quit without a scripting warning."""
+        self._itunes = None
+        self._path_cache = {}
+
     def refresh(
         self,
         file_paths: list[str],
@@ -1044,6 +1049,7 @@ class LibraryManagerApp(QMainWindow):
         if getattr(self, '_artwork_thread', None) and self._artwork_thread.isRunning():
             self._artwork_thread.stop()
             self._artwork_thread.wait(500)
+        self._refresher.disconnect()
         event.accept()
 
 
