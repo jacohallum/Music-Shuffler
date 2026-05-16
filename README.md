@@ -19,9 +19,11 @@ A custom music player for large iTunes/M4A libraries with a smart shuffle algori
 - [mutagen](https://pypi.org/project/mutagen/) — audio metadata
 - [Pillow](https://pypi.org/project/Pillow/) — album artwork
 - [FFmpeg](https://ffmpeg.org/download.html) — M4A/FLAC conversion (must be on PATH or configured)
+- [PyQt6](https://pypi.org/project/PyQt6/) — GUI framework for Library Manager
+- [pywin32](https://pypi.org/project/pywin32/) — iTunes COM automation for Library Manager (Windows only)
 
 ```
-pip install pygame mutagen Pillow
+pip install pygame mutagen Pillow PyQt6 pywin32
 ```
 
 ## Setup
@@ -58,3 +60,4 @@ The `music_shuffler_cache/` directory contains your personal library index and l
 | `utlities/check_track_stats.py <path>` | Show Smart Shuffle weight breakdown for a specific track |
 | `utlities/detect_media_keys.py` | Debug global media key detection |
 | `scripts/preflight_privacy_check.sh` | Verify no personal paths/cache files would be committed before a push |
+| `utlities/library_manager.py` | GUI tool to sort album track order by date-added and edit all song metadata. Run: `python utlities/library_manager.py` |
