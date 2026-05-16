@@ -10,6 +10,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from collections import defaultdict
 import io
+import base64
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
@@ -56,6 +57,9 @@ class TrackInfo:
     rating: int             # 0–100 iTunes scale
     date_added: datetime | None
     file_path: str          # normalized Windows path
+    track_total: int = 0    # 0 = unknown
+    disc_total: int = 0     # 0 = unknown
+    compilation: bool = False
 
 
 @dataclass
@@ -69,6 +73,34 @@ class AlbumInfo:
 
 class DRMError(Exception):
     pass
+
+
+def _int_or_zero(value) -> int:
+    if value in (None, ''):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _album_identity(
+    artist: str,
+    album_artist: str,
+    album: str,
+    compilation: bool = False,
+) -> tuple[tuple[str, str], str, str]:
+    album_name = album or 'Unknown Album'
+    group_artist = 'Various Artists' if compilation else (album_artist or artist)
+    display_artist = album_artist or ('Various Artists' if compilation else artist)
+    return (group_artist.lower(), album_name.lower()), album_name, display_artist
+
+
+def _album_key_for_track(track: TrackInfo) -> tuple[str, str]:
+    key, _, _ = _album_identity(
+        track.artist, track.album_artist, track.album, track.compilation
+    )
+    return key
 
 
 # ── iTunesXMLReader ───────────────────────────────────────────────────────────
@@ -99,48 +131,57 @@ class iTunesXMLReader:
         by_album: dict[tuple[str, str], list[TrackInfo]] = defaultdict(list)
         album_display: dict[tuple[str, str], dict] = {}
 
-        for _, t in raw_tracks.items():
+        for track_id, t in raw_tracks.items():
             location = t.get('Location', '')
             if not location:
                 continue
             try:
                 parsed = urlparse(location)
                 path = unquote(parsed.path)
-                if path.startswith('/') and ':' in path:
+                if parsed.netloc and parsed.netloc.lower() != 'localhost':
+                    # UNC: file://NAS/Music/... → \\NAS\Music\...
+                    path = '//' + parsed.netloc + path
+                elif path.startswith('/') and ':' in path:
                     path = path[1:]
                 path = os.path.normcase(os.path.normpath(path))
-            except Exception:
+
+                artist = t.get('Artist', '') or ''
+                album_artist = t.get('Album Artist', '') or ''
+                album = t.get('Album', '') or ''
+                compilation = bool(t.get('Compilation'))
+                key, album_name, display_artist = _album_identity(
+                    artist, album_artist, album, compilation
+                )
+
+                date_added = t.get('Date Added')
+                track = TrackInfo(
+                    title=t.get('Name', '') or '',
+                    artist=artist,
+                    album=album,
+                    album_artist=album_artist,
+                    year=str(t.get('Year', '')) if t.get('Year') else '',
+                    genre=t.get('Genre', '') or '',
+                    composer=t.get('Composer', '') or '',
+                    comment=t.get('Comments', '') or '',
+                    track_number=_int_or_zero(t.get('Track Number')),
+                    disc_number=_int_or_zero(t.get('Disc Number')),
+                    bpm=_int_or_zero(t.get('BPM')),
+                    rating=_int_or_zero(t.get('Rating')),
+                    date_added=date_added if isinstance(date_added, datetime) else None,
+                    file_path=path,
+                    track_total=_int_or_zero(t.get('Track Count')),
+                    disc_total=_int_or_zero(t.get('Disc Count')),
+                    compilation=compilation,
+                )
+                by_album[key].append(track)
+                if key not in album_display:
+                    album_display[key] = {
+                        'album_name': album_name,
+                        'display_artist': display_artist,
+                    }
+            except Exception as e:
+                print(f'[library_manager] XML: skipped track {track_id}: {e}', file=sys.stderr)
                 continue
-
-            artist = t.get('Artist', '') or ''
-            album_artist = t.get('Album Artist', '') or ''
-            album = t.get('Album', '') or 'Unknown Album'
-            group_artist = album_artist or artist
-            key = (group_artist.lower(), album.lower())
-
-            date_added = t.get('Date Added')
-            track = TrackInfo(
-                title=t.get('Name', '') or '',
-                artist=artist,
-                album=album,
-                album_artist=album_artist,
-                year=str(t.get('Year', '')) if t.get('Year') else '',
-                genre=t.get('Genre', '') or '',
-                composer=t.get('Composer', '') or '',
-                comment=t.get('Comments', '') or '',
-                track_number=int(t.get('Track Number', 0) or 0),
-                disc_number=int(t.get('Disc Number', 0) or 0),
-                bpm=int(t.get('BPM', 0) or 0),
-                rating=int(t.get('Rating', 0) or 0),
-                date_added=date_added if isinstance(date_added, datetime) else None,
-                file_path=path,
-            )
-            by_album[key].append(track)
-            if key not in album_display:
-                album_display[key] = {
-                    'album_name': album,
-                    'display_artist': album_artist or artist,
-                }
 
         tracks_by_album: dict[tuple[str, str], list[TrackInfo]] = {}
         album_list: list[AlbumInfo] = []
@@ -195,7 +236,7 @@ class MetadataWriter:
             elif ext == '.flac':
                 return self._write_flac(track, artwork_bytes)
             elif ext == '.ogg':
-                return self._write_ogg(track)
+                return self._write_ogg(track, artwork_bytes)
             elif ext == '.aac':
                 try:
                     return self._write_aac(track)
@@ -217,21 +258,31 @@ class MetadataWriter:
                 audio = MP3(track.file_path)
                 if audio.tags is None:
                     audio.add_tags()
-                audio.tags['TRCK'] = TRCK(encoding=3, text=[str(track.track_number)])
+                trck_val = f'{track.track_number}/{track.track_total}' if track.track_total else str(track.track_number)
+                audio.tags['TRCK'] = TRCK(encoding=3, text=[trck_val])
                 audio.save()
             elif ext in ('.m4a', '.m4b', '.mp4'):
                 audio = MP4(track.file_path)
                 existing = audio.get('trkn', [(0, 0)])
-                total = existing[0][1] if existing else 0
+                file_total = existing[0][1] if existing else 0
+                total = track.track_total or file_total
                 audio['trkn'] = [(track.track_number, total)]
                 audio.save()
             elif ext == '.flac':
                 audio = FLAC(track.file_path)
                 audio['TRACKNUMBER'] = [str(track.track_number)]
+                if track.track_total:
+                    audio['TRACKTOTAL'] = [str(track.track_total)]
+                elif 'TRACKTOTAL' in audio:
+                    del audio['TRACKTOTAL']
                 audio.save()
             elif ext == '.ogg':
                 audio = OggVorbis(track.file_path)
-                audio['TRACKNUMBER'] = [str(track.track_number)]
+                audio['tracknumber'] = [str(track.track_number)]
+                if track.track_total:
+                    audio['tracktotal'] = [str(track.track_total)]
+                elif 'tracktotal' in audio:
+                    del audio['tracktotal']
                 audio.save()
             elif ext == '.aac':
                 return ['AAC: raw AAC does not support tag writes — track number not written']
@@ -258,9 +309,11 @@ class MetadataWriter:
         tags['TCON'] = TCON(encoding=3, text=[track.genre])
         tags['TCOM'] = TCOM(encoding=3, text=[track.composer])
         tags['COMM'] = COMM(encoding=3, lang='eng', desc='', text=[track.comment])
-        tags['TRCK'] = TRCK(encoding=3, text=[str(track.track_number)])
+        trck_val = f'{track.track_number}/{track.track_total}' if track.track_total else str(track.track_number)
+        tags['TRCK'] = TRCK(encoding=3, text=[trck_val])
         if track.disc_number:
-            tags['TPOS'] = TPOS(encoding=3, text=[str(track.disc_number)])
+            tpos_val = f'{track.disc_number}/{track.disc_total}' if track.disc_total else str(track.disc_number)
+            tags['TPOS'] = TPOS(encoding=3, text=[tpos_val])
         else:
             tags.delall('TPOS')
         if track.bpm:
@@ -286,10 +339,12 @@ class MetadataWriter:
         audio['©wrt'] = [track.composer]
         audio['©cmt'] = [track.comment]
         existing_trkn = audio.get('trkn', [(0, 0)])
-        total = existing_trkn[0][1] if existing_trkn else 0
-        audio['trkn'] = [(track.track_number, total)]
+        file_trkn_total = existing_trkn[0][1] if existing_trkn else 0
+        audio['trkn'] = [(track.track_number, track.track_total or file_trkn_total)]
         if track.disc_number:
-            audio['disk'] = [(track.disc_number, 0)]
+            existing_disk = audio.get('disk', [(0, 0)])
+            file_disk_total = existing_disk[0][1] if existing_disk else 0
+            audio['disk'] = [(track.disc_number, track.disc_total or file_disk_total)]
         else:
             audio.pop('disk', None)
         if track.bpm:
@@ -312,10 +367,20 @@ class MetadataWriter:
         audio['COMPOSER'] = [track.composer]
         audio['COMMENT'] = [track.comment]
         audio['TRACKNUMBER'] = [str(track.track_number)]
+        if track.track_total:
+            audio['TRACKTOTAL'] = [str(track.track_total)]
+        elif 'TRACKTOTAL' in audio:
+            del audio['TRACKTOTAL']
         if track.disc_number:
             audio['DISCNUMBER'] = [str(track.disc_number)]
+            if track.disc_total:
+                audio['DISCTOTAL'] = [str(track.disc_total)]
+            elif 'DISCTOTAL' in audio:
+                del audio['DISCTOTAL']
         elif 'DISCNUMBER' in audio:
             del audio['DISCNUMBER']
+            if 'DISCTOTAL' in audio:
+                del audio['DISCTOTAL']
         if track.bpm:
             audio['BPM'] = [str(track.bpm)]
         elif 'BPM' in audio:
@@ -330,7 +395,7 @@ class MetadataWriter:
         audio.save()
         return []
 
-    def _write_ogg(self, track: TrackInfo) -> list[str]:
+    def _write_ogg(self, track: TrackInfo, artwork_bytes: bytes | None) -> list[str]:
         audio = OggVorbis(track.file_path)
         audio['title'] = [track.title]
         audio['artist'] = [track.artist]
@@ -341,14 +406,35 @@ class MetadataWriter:
         audio['composer'] = [track.composer]
         audio['comment'] = [track.comment]
         audio['tracknumber'] = [str(track.track_number)]
+        if track.track_total:
+            audio['tracktotal'] = [str(track.track_total)]
+        elif 'tracktotal' in audio:
+            del audio['tracktotal']
         if track.disc_number:
             audio['discnumber'] = [str(track.disc_number)]
+            if track.disc_total:
+                audio['disctotal'] = [str(track.disc_total)]
+            elif 'disctotal' in audio:
+                del audio['disctotal']
         elif 'discnumber' in audio:
             del audio['discnumber']
+            if 'disctotal' in audio:
+                del audio['disctotal']
         if track.bpm:
             audio['bpm'] = [str(track.bpm)]
         elif 'bpm' in audio:
             del audio['bpm']
+        if artwork_bytes:
+            pic = FLACPicture()
+            pic.type = 3
+            pic.mime = self._image_mime(artwork_bytes)
+            pic.data = artwork_bytes
+            pic.width = pic.height = pic.depth = pic.colors = 0
+            audio['metadata_block_picture'] = [
+                base64.b64encode(pic.write()).decode('ascii')
+            ]
+        else:
+            audio.pop('metadata_block_picture', None)
         audio.save()
         return []
 
@@ -389,7 +475,8 @@ class iTunesCOMRefresher:
                 if loc:
                     norm = os.path.normcase(os.path.normpath(loc))
                     self._path_cache[norm] = track
-            except Exception:
+            except Exception as e:
+                print(f'[library_manager] COM cache: skipped track {i}: {e}', file=sys.stderr)
                 continue
 
     def disconnect(self) -> None:
@@ -443,6 +530,17 @@ def _extract_artwork_bytes(file_path: str) -> bytes | None:
         covers = (audio.tags or {}).get('covr')
         if covers:
             return bytes(covers[0])
+        # OGG/Vorbis
+        pictures = (audio.tags or {}).get('metadata_block_picture')
+        if pictures:
+            for encoded_picture in pictures:
+                try:
+                    if isinstance(encoded_picture, bytes):
+                        encoded_picture = encoded_picture.decode('ascii')
+                    picture = FLACPicture(base64.b64decode(encoded_picture))
+                    return picture.data
+                except Exception:
+                    continue
         # FLAC
         if hasattr(audio, 'pictures') and audio.pictures:
             return audio.pictures[0].data
@@ -634,12 +732,23 @@ class MetadataDialog(QDialog):
         )
         if not path:
             return
-        self._new_artwork_bytes = Path(path).read_bytes()
-        pixmap = QPixmap(path).scaled(
-            120, 120,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        if path.lower().endswith('.webp'):
+            with Image.open(path) as img:
+                buf = io.BytesIO()
+                img.convert('RGB').save(buf, format='JPEG', quality=90)
+                self._new_artwork_bytes = buf.getvalue()
+        else:
+            self._new_artwork_bytes = Path(path).read_bytes()
+        pixmap = QPixmap()
+        pixmap.loadFromData(self._new_artwork_bytes)
+        if pixmap.isNull():
+            pixmap = _placeholder_pixmap(120)
+        else:
+            pixmap = pixmap.scaled(
+                120, 120,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         self._art_label.setPixmap(pixmap)
 
     def updated_track_and_artwork(self) -> tuple[TrackInfo, bytes | None]:
@@ -658,6 +767,9 @@ class MetadataDialog(QDialog):
             rating=self._f_rating.rating(),
             date_added=self._track.date_added,
             file_path=self._track.file_path,
+            track_total=self._track.track_total,
+            disc_total=self._track.disc_total,
+            compilation=self._track.compilation,
         )
         return updated, self._new_artwork_bytes
 
@@ -908,6 +1020,71 @@ class LibraryManagerApp(QMainWindow):
             self._song_table.setItem(i, 3, QTableWidgetItem(date_str))
             self._song_table.setItem(i, 4, QTableWidgetItem(str(track.disc_number or '')))
 
+    def _replace_saved_track_in_library(self, updated_track: TrackInfo) -> tuple[str, str]:
+        new_key = _album_key_for_track(updated_track)
+        found_key = None
+        found_index = None
+
+        candidate_keys = []
+        if self._current_key in self._tracks_by_album:
+            candidate_keys.append(self._current_key)
+        candidate_keys.extend(
+            key for key in self._tracks_by_album
+            if key not in candidate_keys
+        )
+
+        for key in candidate_keys:
+            for i, track in enumerate(self._tracks_by_album[key]):
+                if track.file_path == updated_track.file_path:
+                    found_key = key
+                    found_index = i
+                    break
+            if found_key is not None:
+                break
+
+        if found_key is None or found_index is None:
+            self._tracks_by_album.setdefault(new_key, []).append(updated_track)
+        elif found_key == new_key:
+            self._tracks_by_album[found_key][found_index] = updated_track
+        else:
+            old_tracks = self._tracks_by_album[found_key]
+            del old_tracks[found_index]
+            if not old_tracks:
+                del self._tracks_by_album[found_key]
+            self._tracks_by_album.setdefault(new_key, []).append(updated_track)
+
+        # _rebuild_albums_from_tracks reads _tracks_by_album (already mutated above)
+        # and overwrites _albums; _current_key must be assigned AFTER the rebuild so
+        # any re-entrant callers see a consistent (_albums, _current_key) pair.
+        self._rebuild_albums_from_tracks()
+        self._current_key = new_key
+        return new_key
+
+    def _rebuild_albums_from_tracks(self):
+        albums: list[AlbumInfo] = []
+        for key, tracks in list(self._tracks_by_album.items()):
+            if not tracks:
+                del self._tracks_by_album[key]
+                continue
+
+            first_track = tracks[0]
+            _, album_name, display_artist = _album_identity(
+                first_track.artist,
+                first_track.album_artist,
+                first_track.album,
+                first_track.compilation,
+            )
+            albums.append(AlbumInfo(
+                key=key,
+                album_name=album_name,
+                display_artist=display_artist,
+                first_track_path=first_track.file_path,
+                track_count=len(tracks),
+            ))
+
+        albums.sort(key=lambda a: a.album_name.lower())
+        self._albums = albums
+
     # ── Sort and track number actions ──
 
     def _sort_by_date_added(self):
@@ -1028,9 +1205,22 @@ class LibraryManagerApp(QMainWindow):
                 write_errors.append(str(e))
 
             item.setData(Qt.ItemDataRole.UserRole, updated_track)
+            self._song_table.item(row, 0).setText(str(updated_track.track_number))
             self._song_table.item(row, 1).setText(updated_track.title)
             self._song_table.item(row, 2).setText(updated_track.artist)
-            self._song_table.item(row, 0).setText(str(updated_track.track_number))
+            self._song_table.item(row, 4).setText(str(updated_track.disc_number or ''))
+
+            old_key = self._current_key
+            new_key = self._replace_saved_track_in_library(updated_track)
+            if new_key != old_key:
+                self._populate_album_list(self._albums)
+                self._filter_albums(self._search.text())
+                new_key_str = f'{new_key[0]}|||{new_key[1]}'
+                new_item = self._album_items.get(new_key_str)
+                if new_item is not None:
+                    self._album_list.setCurrentItem(new_item)
+                else:
+                    self._populate_song_table(self._tracks_by_album.get(new_key, []))
 
         if drm_skipped:
             self._status_bar.showMessage('DRM file — metadata not written.')

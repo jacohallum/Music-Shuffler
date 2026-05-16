@@ -8,15 +8,19 @@ Run with:
 import os
 import sys
 import unittest
+import base64
 from unittest.mock import patch, MagicMock, mock_open
 from datetime import datetime
 from pathlib import Path
+
+from mutagen.flac import Picture as FLACPicture
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utlities.library_manager import (
     TrackInfo, AlbumInfo, DRMError,
     iTunesXMLReader, MetadataWriter, iTunesCOMRefresher,
+    LibraryManagerApp, _extract_artwork_bytes,
 )
 
 
@@ -131,6 +135,61 @@ class TestITunesXMLReader(unittest.TestCase):
             self.assertNotIn('/', t.file_path)
             self.assertTrue(t.file_path[1] == ':')  # Windows drive letter
 
+    def test_bad_numeric_fields_do_not_drop_track(self):
+        lib = {
+            'Tracks': {
+                '1': {
+                    'Name': 'Bad Numbers',
+                    'Artist': 'Artist X',
+                    'Album': 'Album One',
+                    'Track Number': 'not-a-track',
+                    'Track Count': 'not-a-count',
+                    'Disc Number': 'not-a-disc',
+                    'Disc Count': 'not-a-disc-count',
+                    'BPM': 'not-a-number',
+                    'Rating': 'not-a-rating',
+                    'Location': 'file:///C:/Music/bad_numbers.mp3',
+                },
+            },
+        }
+
+        albums, tracks_by_album = self._reader_with_mock_library(lib)
+
+        self.assertEqual(len(albums), 1)
+        track = tracks_by_album[('artist x', 'album one')][0]
+        self.assertEqual(track.track_number, 0)
+        self.assertEqual(track.track_total, 0)
+        self.assertEqual(track.disc_number, 0)
+        self.assertEqual(track.disc_total, 0)
+        self.assertEqual(track.bpm, 0)
+        self.assertEqual(track.rating, 0)
+
+    def test_compilation_without_album_artist_displays_various_artists(self):
+        lib = {
+            'Tracks': {
+                '1': {
+                    'Name': 'Song A',
+                    'Artist': 'Artist X',
+                    'Album': 'Hits',
+                    'Compilation': True,
+                    'Location': 'file:///C:/Music/song_a.mp3',
+                },
+                '2': {
+                    'Name': 'Song B',
+                    'Artist': 'Artist Y',
+                    'Album': 'Hits',
+                    'Compilation': True,
+                    'Location': 'file:///C:/Music/song_b.mp3',
+                },
+            },
+        }
+
+        albums, _ = self._reader_with_mock_library(lib)
+
+        self.assertEqual(len(albums), 1)
+        self.assertEqual(albums[0].key, ('various artists', 'hits'))
+        self.assertEqual(albums[0].display_artist, 'Various Artists')
+
 
 class TestMetadataWriter(unittest.TestCase):
 
@@ -227,6 +286,131 @@ class TestMetadataWriter(unittest.TestCase):
 
         mock_audio.__setitem__.assert_called_once_with('trkn', [(7, 12)])
         mock_audio.save.assert_called_once()
+
+    @patch('utlities.library_manager.MP4')
+    def test_write_track_number_m4a_prefers_track_total(self, mock_mp4_cls):
+        mock_audio = MagicMock()
+        mock_audio.get.return_value = [(3, 0)]
+        mock_mp4_cls.return_value = mock_audio
+
+        writer = MetadataWriter()
+        track = self._make_track(ext='.m4a', track_number=7, track_total=12)
+        writer.write_track_number(track)
+
+        mock_audio.__setitem__.assert_called_once_with('trkn', [(7, 12)])
+        mock_audio.save.assert_called_once()
+
+    @patch('utlities.library_manager.FLAC')
+    def test_write_track_number_flac_writes_track_total(self, mock_flac_cls):
+        mock_audio = MagicMock()
+        mock_flac_cls.return_value = mock_audio
+
+        writer = MetadataWriter()
+        track = self._make_track(ext='.flac', track_number=7, track_total=12)
+        writer.write_track_number(track)
+
+        calls = [call.args for call in mock_audio.__setitem__.call_args_list]
+        self.assertIn(('TRACKNUMBER', ['7']), calls)
+        self.assertIn(('TRACKTOTAL', ['12']), calls)
+        mock_audio.save.assert_called_once()
+
+    @patch('utlities.library_manager.OggVorbis')
+    def test_write_track_number_ogg_writes_track_total(self, mock_ogg_cls):
+        mock_audio = MagicMock()
+        mock_ogg_cls.return_value = mock_audio
+
+        writer = MetadataWriter()
+        track = self._make_track(ext='.ogg', track_number=7, track_total=12)
+        writer.write_track_number(track)
+
+        calls = [call.args for call in mock_audio.__setitem__.call_args_list]
+        self.assertIn(('tracknumber', ['7']), calls)
+        self.assertIn(('tracktotal', ['12']), calls)
+        mock_audio.save.assert_called_once()
+
+    @patch('utlities.library_manager.OggVorbis')
+    def test_write_ogg_writes_track_and_disc_totals(self, mock_ogg_cls):
+        mock_audio = MagicMock()
+        mock_ogg_cls.return_value = mock_audio
+
+        writer = MetadataWriter()
+        track = self._make_track(
+            ext='.ogg',
+            track_number=7,
+            track_total=12,
+            disc_number=1,
+            disc_total=2,
+        )
+        writer.write_all(track)
+
+        calls = [call.args for call in mock_audio.__setitem__.call_args_list]
+        self.assertIn(('tracktotal', ['12']), calls)
+        self.assertIn(('disctotal', ['2']), calls)
+        mock_audio.save.assert_called_once()
+
+
+class TestArtworkHelpers(unittest.TestCase):
+
+    @patch('utlities.library_manager.MutagenFile')
+    def test_extracts_ogg_metadata_block_picture(self, mock_mutagen_file):
+        picture = FLACPicture()
+        picture.type = 3
+        picture.mime = 'image/png'
+        picture.data = b'png-bytes'
+        encoded_picture = base64.b64encode(picture.write()).decode('ascii')
+        mock_audio = MagicMock()
+        mock_audio.tags = {'metadata_block_picture': [encoded_picture]}
+        mock_audio.pictures = []
+        mock_mutagen_file.return_value = mock_audio
+
+        image_bytes = _extract_artwork_bytes(r'C:\Music\song.ogg')
+
+        self.assertEqual(image_bytes, b'png-bytes')
+
+
+class TestLibraryManagerAppState(unittest.TestCase):
+
+    def _make_track(self, **kwargs):
+        defaults = dict(
+            title='Test Song', artist='Test Artist', album='Old Album',
+            album_artist='Old Artist', year='2020', genre='Rock',
+            composer='Test Composer', comment='A comment',
+            track_number=1, disc_number=0, bpm=0, rating=0,
+            date_added=datetime(2021, 1, 1), file_path=r'C:\Music\song.mp3',
+        )
+        defaults.update(kwargs)
+        return TrackInfo(**defaults)
+
+    def test_metadata_save_rekeys_album_identity(self):
+        app = type('DummyApp', (), {})()
+        old_track = self._make_track()
+        updated_track = self._make_track(album='New Album', album_artist='New Artist')
+        old_key = ('old artist', 'old album')
+        new_key = ('new artist', 'new album')
+        app._current_key = old_key
+        app._tracks_by_album = {old_key: [old_track]}
+        app._albums = [
+            AlbumInfo(
+                key=old_key,
+                album_name='Old Album',
+                display_artist='Old Artist',
+                first_track_path=old_track.file_path,
+                track_count=1,
+            ),
+        ]
+        app._rebuild_albums_from_tracks = (
+            LibraryManagerApp._rebuild_albums_from_tracks.__get__(app)
+        )
+
+        LibraryManagerApp._replace_saved_track_in_library(app, updated_track)
+
+        self.assertNotIn(old_key, app._tracks_by_album)
+        self.assertEqual(app._tracks_by_album[new_key], [updated_track])
+        self.assertEqual(app._current_key, new_key)
+        self.assertEqual(len(app._albums), 1)
+        self.assertEqual(app._albums[0].key, new_key)
+        self.assertEqual(app._albums[0].album_name, 'New Album')
+        self.assertEqual(app._albums[0].display_artist, 'New Artist')
 
 
 class TestITunesCOMRefresher(unittest.TestCase):
