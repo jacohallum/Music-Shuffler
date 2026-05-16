@@ -23,8 +23,7 @@ config.local.json
 .idea/
 .claude/
 
-# Internal planning notes only (not public docs)
-docs/plans/
+docs/
 
 # Personal music lists and data
 utlities/albums_needed.txt
