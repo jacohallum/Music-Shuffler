@@ -1346,17 +1346,26 @@ class MusicPlayerGUI:
             print("  Then restart the app")
             return
 
-        def ui_call(fn):
+        def ui_call(fn, label):
+            print(f"[MEDIA KEY] {label} triggered → dispatching to UI thread")
             self.root.after(0, fn)
 
+        def _key_hook(event):
+            if event.event_type == 'down':
+                print(f"[KEY HOOK] name={repr(event.name)} scan={event.scan_code}")
+        keyboard.hook(_key_hook)
+
+        # F5-F8: intercept raw F-keys before fnlock translates them (keyboard lib
+        # hook installs after fnlock so fires first in Windows LIFO hook chain).
+        # F9-F11: let fnlock translate to volume VKs, then catch those.
         hotkeys = [
-            ('previous track',   self.previous_track,   'Previous',    True),
-            ('play/pause media', self.toggle_play_pause, 'Play/Pause',  True),
-            ('next track',       self.next_track,        'Next',        True),
-            ('stop media',       self.stop,              'Stop',        True),
-            ('volume mute',      self.toggle_mute,       'Mute Toggle', False),
-            ('volume down',      self.volume_down,       'Volume Down', False),
-            ('volume up',        self.volume_up,         'Volume Up',   False),
+            ('f5',          self.previous_track,   'Previous (F5)',    True),
+            ('f6',          self.next_track,        'Next (F6)',        True),
+            ('f7',          self.toggle_play_pause, 'Play/Pause (F7)', True),
+            ('f8',          self.stop,              'Stop (F8)',        True),
+            ('volume mute', self.toggle_mute,       'Mute (F9)',       False),
+            ('volume down', self.volume_down,       'Vol Down (F10)',  False),
+            ('volume up',   self.volume_up,         'Vol Up (F11)',    False),
         ]
 
         registered_keys = []
@@ -1364,7 +1373,7 @@ class MusicPlayerGUI:
 
         for key_name, fn, label, suppress in hotkeys:
             try:
-                keyboard.add_hotkey(key_name, lambda fn=fn: ui_call(fn), suppress=suppress)
+                keyboard.add_hotkey(key_name, lambda fn=fn, label=label: ui_call(fn, label), suppress=suppress)
                 registered_keys.append(f"{key_name.upper()} = {label}")
             except Exception as e:
                 failed_keys.append(f"{key_name.upper()} ({e})")
