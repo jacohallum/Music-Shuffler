@@ -1330,7 +1330,7 @@ class MusicPlayerGUI:
     
     def setup_keyboard_shortcuts(self):
         """Setup keyboard shortcuts for playback controls"""
-        # F5-F8 global hotkeys handle playback - no need to block other keys
+        # Media keys (sent by fnlock from F5-F11) handle playback globally
         self._setup_global_media_keys()
         
         print("Keyboard shortcuts enabled:")
@@ -1350,21 +1350,21 @@ class MusicPlayerGUI:
             self.root.after(0, fn)
 
         hotkeys = [
-            ('f2', self.volume_down, 'Volume Down'),
-            ('f3', self.volume_up, 'Volume Up'),
-            ('f4', self.toggle_mute, 'Mute Toggle'),
-            ('f5', self.stop, 'Stop'),
-            ('f6', self.previous_track, 'Previous'),
-            ('f7', self.toggle_play_pause, 'Play/Pause'),
-            ('f8', self.next_track, 'Next'),
+            ('previous track',   self.previous_track,   'Previous',    True),
+            ('play/pause media', self.toggle_play_pause, 'Play/Pause',  True),
+            ('next track',       self.next_track,        'Next',        True),
+            ('stop media',       self.stop,              'Stop',        True),
+            ('volume mute',      self.toggle_mute,       'Mute Toggle', False),
+            ('volume down',      self.volume_down,       'Volume Down', False),
+            ('volume up',        self.volume_up,         'Volume Up',   False),
         ]
 
         registered_keys = []
         failed_keys = []
-        
-        for key_name, fn, label in hotkeys:
+
+        for key_name, fn, label, suppress in hotkeys:
             try:
-                keyboard.add_hotkey(key_name, lambda fn=fn: ui_call(fn), suppress=True)
+                keyboard.add_hotkey(key_name, lambda fn=fn: ui_call(fn), suppress=suppress)
                 registered_keys.append(f"{key_name.upper()} = {label}")
             except Exception as e:
                 failed_keys.append(f"{key_name.upper()} ({e})")
@@ -2793,21 +2793,21 @@ class MusicPlayerGUI:
         dialog.title("Test Hotkeys")
         dialog.geometry("500x400")
         
-        ttk.Label(dialog, text="Press F2-F8 to test hotkeys", 
+        ttk.Label(dialog, text="Press F5-F11 to test hotkeys (via fnlock)",
                  font=('Arial', 12, 'bold')).pack(pady=10)
-        
+
         text = tk.Text(dialog, height=15, width=55, wrap=tk.WORD)
         text.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
-        
-        text.insert(tk.END, "Expected hotkeys:\n")
-        text.insert(tk.END, "  F2 = Volume Down\n")
-        text.insert(tk.END, "  F3 = Volume Up\n")
-        text.insert(tk.END, "  F4 = Mute Toggle\n")
-        text.insert(tk.END, "  F5 = Stop\n")
-        text.insert(tk.END, "  F6 = Previous\n")
-        text.insert(tk.END, "  F7 = Play/Pause\n")
-        text.insert(tk.END, "  F8 = Next\n\n")
-        text.insert(tk.END, "Press any F2-F8 key and check the console for output.\n\n")
+
+        text.insert(tk.END, "Expected hotkeys (fnlock F-key → media key):\n")
+        text.insert(tk.END, "  F5  → Media Prev\n")
+        text.insert(tk.END, "  F6  → Media Play/Pause\n")
+        text.insert(tk.END, "  F7  → Media Next\n")
+        text.insert(tk.END, "  F8  → Media Stop\n")
+        text.insert(tk.END, "  F9  → Volume Mute\n")
+        text.insert(tk.END, "  F10 → Volume Down\n")
+        text.insert(tk.END, "  F11 → Volume Up\n\n")
+        text.insert(tk.END, "Press any F5-F11 key and check the console for output.\n\n")
         
         try:
             import keyboard
