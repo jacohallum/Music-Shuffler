@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QPixmap, QColor, QPainter, QFont, QIcon
+from PyQt6.QtGui import QPixmap, QColor, QPainter, QFont, QIcon, QAction
 
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
@@ -824,6 +824,12 @@ class LibraryManagerApp(QMainWindow):
     # ── UI construction ──
 
     def _build_ui(self):
+        file_menu = self.menuBar().addMenu('&File')
+        refresh_action = QAction('&Refresh Library', self)
+        refresh_action.setShortcut('Ctrl+R')
+        refresh_action.triggered.connect(self._rescan_library)
+        file_menu.addAction(refresh_action)
+
         central = QWidget()
         self.setCentralWidget(central)
 
@@ -898,6 +904,15 @@ class LibraryManagerApp(QMainWindow):
         try:
             self._albums, self._tracks_by_album = self._reader.load()
         except FileNotFoundError as e:
+            self._albums = []
+            self._tracks_by_album = {}
+            self._current_key = None
+            self._search.clear()
+            self._album_list.clear()
+            self._album_items.clear()
+            self._song_table.setRowCount(0)
+            self._sort_btn.setEnabled(False)
+            self._apply_btn.setEnabled(False)
             QMessageBox.critical(self, 'Library Not Found', str(e))
             self._status_bar.showMessage('Library not found.')
             return
@@ -908,6 +923,29 @@ class LibraryManagerApp(QMainWindow):
             f'Ready — {len(self._albums)} albums, {count:,} tracks'
         )
         self._start_artwork_loader(self._albums)
+
+    def _rescan_library(self):
+        if getattr(self, '_artwork_thread', None) and self._artwork_thread.isRunning():
+            self._artwork_thread.stop()
+            self._artwork_thread.artwork_ready.disconnect()
+            if not self._artwork_thread.wait(500):
+                print('[library_manager] artwork thread did not stop in time', file=sys.stderr)
+
+        try:
+            self._album_list.verticalScrollBar().valueChanged.disconnect()
+        except RuntimeError:
+            pass
+
+        self._current_key = None
+        self._song_table.setRowCount(0)
+        self._sort_btn.setEnabled(False)
+        self._apply_btn.setEnabled(False)
+        self._search.clear()
+        self._album_list.clear()
+        self._album_items.clear()
+        self._refresher.disconnect()
+        self._status_bar.showMessage('Rescanning library…')
+        self._load_library()
 
     def _populate_album_list(self, albums: list[AlbumInfo]):
         placeholder = _placeholder_pixmap(60)
@@ -1094,6 +1132,7 @@ class LibraryManagerApp(QMainWindow):
         sorted_tracks = sorted(
             tracks, key=lambda t: t.date_added or datetime.min
         )
+        self._tracks_by_album[self._current_key] = sorted_tracks
         self._populate_song_table(sorted_tracks)
 
     def _current_table_tracks(self) -> list[TrackInfo]:
@@ -1170,6 +1209,9 @@ class LibraryManagerApp(QMainWindow):
             parts.append(f'{len(write_errors)} errors — see console.')
         self._status_bar.showMessage(' '.join(parts))
         print(f'[library_manager] Done — {len(successful)} written, {len(write_errors)} errors, {drm_count} DRM skipped.', flush=True)
+
+        if self._current_key is not None:
+            self._tracks_by_album[self._current_key] = self._current_table_tracks()
 
     # ── Metadata dialog ──
 
